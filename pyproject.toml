@@ -1,0 +1,25 @@
+[project]
+name = "vlm-crossing"
+version = "0.1.0"
+description = "Pedestrian crossing speed and hesitation time from dashcam videos with YOLOv11x and BoT-SORT"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "coloredlogs>=15.0.1",
+    "flake8==7.1.1",
+    "kaleido==0.2.1",
+    "lap>=0.5.12",
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "opencv-python>=4.9",
+    "plotly==5.24.1",
+    "polars>=1.33.1",
+    "pyyaml>=6.0",
+    "torch>=2.3",
+    "torchvision>=0.18",
+    "tqdm>=4.66",
+    "ultralytics>=8.3.182",
+]
+
+[tool.flake8]
+max-line-length = 120

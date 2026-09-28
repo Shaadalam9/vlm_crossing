@@ -1,0 +1,38 @@
+# Runs and output folders
+runs/
+_output/
+_cache/
+_logs/
+figures/
+
+# Video and data folders
+data/*
+!data/.gitkeep
+
+# Model files
+*.pt
+*.engine
+*.onnx
+
+# Python environment files
+.vscode/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.egg-info/
+.venv
+
+# macOS specific files
+**/.DS_Store
+
+# Instance specific files
+config
+secret
+
+# Pickle files
+*.pickle
+*.pkl
+
+# log files
+*.log
+*.out
