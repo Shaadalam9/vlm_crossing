@@ -23,11 +23,14 @@ and on the whole body being visible in the box.
 Hesitation time
 ---------------
 Following crowd-city's time_to_start_cross, the track is sampled
-check_per_sec_time times per second. A sample is stationary when the lateral
-position moved at most 10% of the stature (0.17 m for 1.70 m) since the
-previous sample. The hesitation time is the first run of at least three
-stationary samples. With hesitation_reference = "road_entry" it is instead the
-stationary run that ends when the pedestrian enters the road strip, walking
+check_per_sec_time times per second. Samples are taken on a grid of frame
+numbers, not of array indices, so frames the detector missed do not shorten or
+stretch the measured time; positions between detections are interpolated
+(segments are already split at gaps longer than a second). A sample is
+stationary when the lateral position moved at most 10% of the stature (0.17 m
+for 1.70 m) since the previous sample. The hesitation time is the first run of
+at least three stationary samples. With hesitation_reference = "road_entry" it
+is instead the stationary run that ends when the pedestrian enters the road strip, walking
 backwards as crowd-city's road_metrics.hesitation_seconds does. Tracks with no
 such run get 0.0 and hesitated = False. Tracks that start already on the road
 have no observable wait and get None for "road_entry".
@@ -131,15 +134,17 @@ class Metrics:
             stationary run of MINIMUM_STATIONARY_SAMPLES samples exists.
         """
         step = max(1, int(round(fps / checks_per_second)))
-        if position_m.size <= step:
+        if frames.size < 2 or int(frames[-1]) - int(frames[0]) < step:
             return None, None
+        # Sample on frame numbers so missed detections do not distort the duration.
+        targets = np.arange(int(frames[0]), int(frames[-1]) + 1, step)
+        position = np.interp(targets, frames, position_m)
         margin = STATIONARY_MARGIN_FRACTION * stature_m
 
         stable_samples = 0
         end_index = None
-        for index in range(0, position_m.size - step, step):
-            delta = abs(float(position_m[index + step]) - float(position_m[index]))
-            if delta <= margin:
+        for index in range(targets.size - 1):
+            if abs(float(position[index + 1]) - float(position[index])) <= margin:
                 stable_samples += 1
             elif stable_samples >= MINIMUM_STATIONARY_SAMPLES:
                 end_index = index
@@ -149,11 +154,11 @@ class Metrics:
         else:
             if stable_samples >= MINIMUM_STATIONARY_SAMPLES:
                 # Stationary until the end of the track: no walking to measure afterwards.
-                end_index = position_m.size - 1
+                end_index = targets.size - 1
 
         if stable_samples < MINIMUM_STATIONARY_SAMPLES:
             return 0.0, None
-        return float(stable_samples * step) / float(fps), int(frames[end_index])
+        return float(stable_samples * step) / float(fps), int(targets[end_index])
 
     @staticmethod
     def hesitation_before_entry(frames: np.ndarray, position_m: np.ndarray, entry_frame: int, fps: float,
@@ -165,18 +170,18 @@ class Metrics:
         None when the track starts less than one sampling interval before the entry.
         """
         step = max(1, int(round(fps / checks_per_second)))
-        entry_index = int(np.clip(np.searchsorted(frames, int(entry_frame)), 0, frames.size - 1))
-        if entry_index < step:
+        entry_frame = int(entry_frame)
+        if entry_frame - int(frames[0]) < step:
             return None
+        targets = np.arange(entry_frame, int(frames[0]) - 1, -step)
+        position = np.interp(targets, frames, position_m)
 
         margin = STATIONARY_MARGIN_FRACTION * stature_m
         stable_samples = 0
-        index = entry_index
-        while index - step >= 0:
-            if abs(float(position_m[index]) - float(position_m[index - step])) > margin:
+        for index in range(targets.size - 1):
+            if abs(float(position[index]) - float(position[index + 1])) > margin:
                 break
             stable_samples += 1
-            index -= step
 
         if stable_samples < MINIMUM_STATIONARY_SAMPLES:
             return 0.0
@@ -256,13 +261,6 @@ class Metrics:
             "person_height_m": stature_m,
         }
 
-    @staticmethod
-    def within_limits(value: Optional[float], minimum_key: str, maximum_key: str) -> bool:
-        """True when value lies within the configured [minimum, maximum]."""
-        if value is None:
-            return False
-        return float(common.get_configs(minimum_key)) <= value <= float(common.get_configs(maximum_key))
-
     def city_summary(self, crossings: pl.DataFrame, videos: pl.DataFrame) -> pl.DataFrame:
         """
         Aggregate crossings per city.
@@ -278,23 +276,30 @@ class Metrics:
             pl.len().alias("videos"),
             (pl.col("duration_s").sum() / 3600.0).alias("footage_h"),
         )
-        if crossings.height == 0:
-            return footage.sort("city")
+        # No early return for zero crossings: the per-city columns must exist
+        # (as nulls) so the plots and the printed summary can rely on them.
 
         speed = pl.col("speed_mps")
         hes = pl.col("hesitation_s")
+        # As in crowd-city, a pedestrian who never stood still has no hesitation
+        # time rather than one of zero: zeros stay in crossings.csv but are left
+        # out of the hesitation statistics, which would otherwise be pulled
+        # towards zero by every crossing without a wait. share_hesitated says how
+        # many waited, and hesitation_mean_all_s keeps the mean with the zeros.
+        waited = hes.filter(hes > 0)
         per_city = crossings.group_by("city").agg(
             pl.len().alias("crossings"),
             speed.drop_nulls().len().alias("crossings_with_speed"),
             speed.mean().alias("speed_mean_mps"),
             speed.median().alias("speed_median_mps"),
             speed.std().alias("speed_std_mps"),
-            hes.drop_nulls().len().alias("crossings_with_hesitation"),
-            hes.mean().alias("hesitation_mean_s"),
-            hes.median().alias("hesitation_median_s"),
-            hes.std().alias("hesitation_std_s"),
+            hes.drop_nulls().len().alias("crossings_hesitation_observed"),
+            waited.len().alias("crossings_hesitated"),
+            waited.mean().alias("hesitation_mean_s"),
+            waited.median().alias("hesitation_median_s"),
+            waited.std().alias("hesitation_std_s"),
             pl.col("hesitated").mean().alias("share_hesitated"),
-            hes.filter(hes > 0).mean().alias("hesitation_mean_if_hesitated_s"),
+            hes.mean().alias("hesitation_mean_all_s"),
             pl.col("crossing_time_s").mean().alias("crossing_time_mean_s"),
         )
         summary = footage.join(per_city, on="city", how="left").with_columns(

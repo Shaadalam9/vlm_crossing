@@ -9,6 +9,7 @@ yolo-id, x-center, y-center, width, height, unique-id, confidence, frame-count
 with box coordinates normalised to the frame size and frame-count starting at 1.
 """
 
+import json
 import logging
 import os
 import shutil
@@ -20,6 +21,7 @@ import numpy as np
 import torch
 import yaml
 from tqdm import tqdm
+import ultralytics
 from ultralytics import YOLO  # type: ignore
 
 import common
@@ -119,6 +121,12 @@ class Video_Helper:
         }
 
     @staticmethod
+    def file_stamp(path: str) -> Dict[str, int]:
+        """Size and modification time of a file, used to reuse metadata of unchanged videos."""
+        stat = os.stat(path)
+        return {"file_size": int(stat.st_size), "file_mtime_ns": int(stat.st_mtime_ns)}
+
+    @staticmethod
     def csv_name(video_path: str, fps: float) -> str:
         """Return the CROWD-style CSV name <video>_<fps>.csv for a video."""
         stem = os.path.splitext(os.path.basename(video_path))[0]
@@ -146,6 +154,36 @@ class Video_Helper:
     # ------------------------------------------------------------------
     # Tracking
     # ------------------------------------------------------------------
+
+    def tracking_settings(self) -> Dict[str, object]:
+        """Settings that change the tracking CSV. Stored next to each CSV as <csv>.json."""
+        tracker = common.resolve_path(self.bbox_tracker)
+        tracker_config = self.bbox_tracker
+        if os.path.exists(tracker):
+            with open(tracker) as f:
+                tracker_config = yaml.safe_load(f)
+            tracker_config.pop("track_buffer", None)  # replaced by track_buffer_sec
+        return {
+            "tracking_model": self.tracking_model,
+            "min_confidence": self.confidence,
+            "yolo_imgsz": self.imgsz,
+            "half_precision": self.half,
+            "track_buffer_sec": common.get_configs("track_buffer_sec"),
+            "tracker": tracker_config,
+            "ultralytics": ultralytics.__version__,
+        }
+
+    @staticmethod
+    def settings_path(output_csv: str) -> str:
+        return os.path.splitext(output_csv)[0] + ".json"
+
+    def stored_tracking_settings(self, output_csv: str) -> Optional[Dict[str, object]]:
+        """Settings a CSV was tracked with, or None for CSVs written before settings were stored."""
+        try:
+            with open(self.settings_path(output_csv)) as f:
+                return json.load(f).get("settings")
+        except (OSError, ValueError):
+            return None
 
     def update_track_buffer_in_yaml(self, yaml_path: str, video_fps: float) -> None:
         """Set track_buffer so lost tracks are kept for track_buffer_sec seconds at this fps."""
@@ -296,6 +334,9 @@ class Video_Helper:
             logger.warning(f"{failed_frames} of {frame_count} frames failed in {input_video_path}.")
 
         os.replace(partial_csv, output_csv)
+        with open(self.settings_path(output_csv), "w") as f:
+            json.dump({"video": os.path.abspath(input_video_path), "frames": frame_count,
+                       "failed_frames": failed_frames, "settings": self.tracking_settings()}, f, indent=1)
         logger.info(f"Wrote {output_csv} ({frame_count} frames).")
         return True
 

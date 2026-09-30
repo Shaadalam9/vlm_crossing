@@ -7,9 +7,9 @@ to the other side, and survives the same geometric false-positive filters as
 CROWD. Frame thresholds are calibrated at 30 fps and scaled to the video fps.
 
 Differences from crowd-city:
-- fps and the city's mean stature come from arguments instead of mapping.csv.
-- The rider filter is a simpler co-location test against bicycles and
-  motorcycles instead of the pooled rider classifier.
+- fps comes from an argument instead of mapping.csv.
+- Detections with unique-id -1 (YOLO boxes the tracker did not assign) are
+  ignored, because they would otherwise be pooled as one object.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -18,7 +18,11 @@ import numpy as np
 import polars as pl
 
 PERSON_CLASS_ID = 0
-TWO_WHEELER_CLASS_IDS = (1, 3)  # bicycle, motorcycle
+BICYCLE_CLASS_ID = 1
+CAR_CLASS_ID = 2
+MOTORCYCLE_CLASS_ID = 3
+BUS_CLASS_ID = 5
+TRUCK_CLASS_ID = 7
 # Objects that do not move in the world: traffic light, fire hydrant, stop sign, parking meter, bench.
 STATIC_CLASS_IDS = (9, 10, 11, 12, 13)
 
@@ -62,6 +66,8 @@ CROSSING_PARAMETER_DEFAULTS = {
     "long_weak_road_frames": 90,
     "jitter_road_frames": 40,
     "camera_min_road_frames": 5,
+    # Reject candidates whose mean lateral speed (normalised x per frame) exceeds this; None disables it.
+    "max_crossing_speed_per_frame": None,
     "base_fps": 30.0,
 }
 
@@ -87,6 +93,32 @@ class Detection:
         except Exception:
             scaled = int(value)
         return max(int(minimum), int(scaled))
+
+    @staticmethod
+    def _longest_frame_run(frames, *, gap_allow: int = 2) -> int:
+        """Return the longest near-continuous run of frame numbers."""
+        try:
+            values = sorted({int(f) for f in frames})
+        except Exception:
+            return 0
+
+        if not values:
+            return 0
+
+        max_run = 1
+        cur_run = 1
+        max_gap = max(int(gap_allow), 0) + 1
+        prev = values[0]
+
+        for frame in values[1:]:
+            if int(frame) - int(prev) <= max_gap:
+                cur_run += 1
+            else:
+                max_run = max(max_run, cur_run)
+                cur_run = 1
+            prev = frame
+
+        return max(max_run, cur_run)
 
     @staticmethod
     def _dedup_per_frame(df: pl.DataFrame) -> pl.DataFrame:
@@ -149,6 +181,10 @@ class Detection:
         jitter_road_frames_s = scaled("jitter_road_frames")
         camera_min_road_frames_s = scaled("camera_min_road_frames")
         rider_min_shared_frames_s = Detection._scale_frames(4, fps_value, base_fps_value)
+        rider_min_continuous_shared_frames_s = Detection._scale_frames(12, fps_value, base_fps_value)
+        rider_shared_run_gap_allow_s = Detection._scale_frames(2, fps_value, base_fps_value, minimum=0)
+        rider_min_motion_steps_s = Detection._scale_frames(3, fps_value, base_fps_value)
+        rider_short_shared_frames_s = Detection._scale_frames(8, fps_value, base_fps_value)
 
         persons = dataframe.filter((pl.col("yolo-id") == PERSON_CLASS_ID) & (pl.col("unique-id") >= 0))
         if persons.height == 0:
@@ -271,6 +307,12 @@ class Detection:
         pedestrian_ids: List[Any] = []
         pedestrian_bounds: Dict[Any, Tuple[int, int]] = {}
 
+        # Sort once by frame. Each candidate window is then located with two
+        # binary searches and extracted with slice(), avoiding a full DataFrame
+        # filter for every candidate.
+        frame_sorted_df = dataframe.filter(pl.col("frame-count").is_not_null()).sort("frame-count")
+        frame_values = frame_sorted_df.get_column("frame-count").cast(pl.Int64, strict=False).to_numpy()
+
         for c in candidate_segments:
             uid = c["uid"]
             if uid in pedestrian_bounds:
@@ -278,9 +320,19 @@ class Detection:
             x_range, x_speed, road_frames = c["x_range"], c["x_speed"], c["road_frames"]
             median_height, median_width, y_gross_motion = c["median_height"], c["median_width"], c["y_gross_motion"]
 
-            segment_df = dataframe.filter(pl.col("frame-count").is_between(c["start_frame"], c["end_frame"]))
+            left_idx = int(np.searchsorted(frame_values, int(c["start_frame"]), side="left"))
+            right_idx = int(np.searchsorted(frame_values, int(c["end_frame"]), side="right"))
+            segment_df = frame_sorted_df.slice(left_idx, max(0, right_idx - left_idx))
 
-            if Detection.is_rider_id(segment_df, uid, min_shared_frames=rider_min_shared_frames_s):
+            if Detection.is_rider_id(
+                segment_df,
+                uid,
+                min_shared_frames=rider_min_shared_frames_s,
+                min_continuous_shared_frames=rider_min_continuous_shared_frames_s,
+                shared_run_gap_allow=rider_shared_run_gap_allow_s,
+                min_motion_steps=rider_min_motion_steps_s,
+                short_shared_frames=rider_short_shared_frames_s,
+            ):
                 continue
 
             static_stats = Detection.static_reference_motion_stats(
@@ -371,6 +423,10 @@ class Detection:
             ):
                 continue
 
+            max_speed = p["max_crossing_speed_per_frame"]
+            if max_speed is not None and x_speed > float(max_speed):
+                continue
+
             if not Detection.is_valid_crossing(segment_df, uid, MIN_SHARED_FRAMES=min_static_shared_frames_s):
                 continue
 
@@ -380,43 +436,388 @@ class Detection:
         return pedestrian_ids, crossed_ids, pedestrian_bounds
 
     @staticmethod
-    def is_rider_id(df: pl.DataFrame, person_id, min_shared_frames: int = 4, coloc_req: float = 0.7,
-                    alpha_x: float = 0.75, beta_y: float = 0.25) -> bool:
+    def classify_rider_type(
+        df: pl.DataFrame,
+        person_id,
+        *,
+        min_shared_frames: int = 4,
+        min_continuous_shared_frames: int = 12,
+        shared_run_gap_allow: int = 2,
+        min_vehicle_width_ratio: float = 0.50,
+        min_vehicle_width_ratio_frames: float = 0.65,
+        dist_rel_thresh: float = 0.8,
+        prox_req: float = 0.7,
+        alpha_x: float = 0.75,
+        beta_y: float = 0.08,
+        gamma_y: float = 1.4,
+        coloc_req: float = 0.7,
+        sim_thresh: float = 0.4,
+        sim_req: float = 0.5,
+        min_motion_steps: int = 3,
+        motion_coloc_min: float = 0.5,
+        short_shared_frames: int = 8,
+        short_sim_req: float = 0.8,
+        short_disp_req: float = 0.12,
+        eps: float = 1e-9,
+        include_large_vehicle_passengers: bool = False,
+        pooled_min_coverage: float = 0.40,
+        pooled_min_person_motion: float = 0.30,
+        pooled_max_motion_mismatch: float = 0.50,
+        pooled_max_offset_std: float = 0.25,
+        pooled_min_seated_share: float = 0.35,
+    ) -> dict:
         """
-        Return True when the person rides (or pushes) a bicycle or motorcycle.
+        Classify whether a person track is associated with a vehicle (crowd-city).
 
-        A person is a rider when, for at least coloc_req of the frames shared with some
-        two-wheeler track, the person's box is horizontally centred on the vehicle
-        (|dx| <= alpha_x * max width) and the person's feet fall inside the vehicle's
-        vertical extent (down to beta_y person-heights below it).
+        For every two-wheeler track sharing a continuous run of frames with the person,
+        the person is a rider when the vehicle stays close, sits below the torso and is
+        at least half as wide in most shared frames, or when it moves with the person.
+        When no single vehicle id qualifies, detections are pooled across ids
+        (see _pooled_two_wheeler_association).
         """
-        person = (
+        not_rider = {
+            "is_rider": False, "rider_type": None, "role": None, "vehicle_id": None,
+            "score": 0.0, "shared_frames": 0, "longest_shared_run": 0,
+        }
+        df = Detection._dedup_per_frame(df)
+
+        p = (
             df.filter((pl.col("yolo-id") == PERSON_CLASS_ID) & (pl.col("unique-id") == person_id))
-            .unique(subset=["frame-count"], keep="first")
+            .sort("frame-count")
         )
-        vehicles = df.filter(pl.col("yolo-id").is_in(list(TWO_WHEELER_CLASS_IDS)) & (pl.col("unique-id") >= 0))
-        if person.height == 0 or vehicles.height == 0:
-            return False
+        if p.height == 0:
+            return not_rider
 
-        for v_track in vehicles.partition_by("unique-id", maintain_order=True):
-            v_track = v_track.unique(subset=["frame-count"], keep="first")
-            joined = person.join(v_track, on="frame-count", how="inner", suffix="_v")
-            if joined.height < int(min_shared_frames):
+        p_frames = p.get_column("frame-count").to_numpy()
+        if p_frames.size < min_shared_frames:
+            return not_rider
+
+        first_frame = int(p_frames.min())
+        last_frame = int(p_frames.max())
+
+        supported_vehicle_classes = [BICYCLE_CLASS_ID, MOTORCYCLE_CLASS_ID]
+        if include_large_vehicle_passengers:
+            supported_vehicle_classes.extend([CAR_CLASS_ID, BUS_CLASS_ID, TRUCK_CLASS_ID])
+
+        vehicles = df.filter(
+            pl.col("frame-count").is_between(first_frame, last_frame)
+            & pl.col("yolo-id").is_in(supported_vehicle_classes)
+            & (pl.col("unique-id") >= 0)
+        )
+        if vehicles.height == 0:
+            return not_rider
+
+        p1 = p.unique(subset=["frame-count"], keep="first")
+        best = None
+
+        for v in vehicles.partition_by("unique-id", maintain_order=True):
+            v = v.sort("frame-count")
+            vid = v.get_column("unique-id")[0]
+            v_class = int(v.get_column("yolo-id")[0])
+            vtype = {
+                BICYCLE_CLASS_ID: "bicycle",
+                MOTORCYCLE_CLASS_ID: "motorcycle",
+                CAR_CLASS_ID: "car",
+                BUS_CLASS_ID: "bus",
+                TRUCK_CLASS_ID: "truck",
+            }.get(v_class)
+            if vtype is None:
                 continue
-            px = joined.get_column("x-center").to_numpy()
-            pw = joined.get_column("width").to_numpy()
-            p_bottom = joined.get_column("y-center").to_numpy() + joined.get_column("height").to_numpy() / 2.0
-            ph = joined.get_column("height").to_numpy()
-            vx = joined.get_column("x-center_v").to_numpy()
-            vw = joined.get_column("width_v").to_numpy()
-            v_top = joined.get_column("y-center_v").to_numpy() - joined.get_column("height_v").to_numpy() / 2.0
-            v_bottom = joined.get_column("y-center_v").to_numpy() + joined.get_column("height_v").to_numpy() / 2.0
 
-            aligned_x = np.abs(px - vx) <= alpha_x * np.maximum(pw, vw)
-            aligned_y = (p_bottom >= v_top) & (p_bottom <= v_bottom + beta_y * ph)
-            if float(np.mean(aligned_x & aligned_y)) >= coloc_req:
-                return True
-        return False
+            role = "rider" if v_class in (BICYCLE_CLASS_ID, MOTORCYCLE_CLASS_ID) else "passenger"
+
+            v1 = v.unique(subset=["frame-count"], keep="first")
+            j = p1.join(v1, on="frame-count", how="inner", suffix="_v")
+            shared = j.height
+            if shared < min_shared_frames:
+                continue
+
+            longest_shared_run = Detection._longest_frame_run(
+                j.get_column("frame-count").to_list(),
+                gap_allow=shared_run_gap_allow,
+            )
+            if role == "rider" and longest_shared_run < int(min_continuous_shared_frames):
+                continue
+
+            p_xy = j.select(["x-center", "y-center"]).to_numpy()
+            v_xy = j.select(["x-center_v", "y-center_v"]).to_numpy()
+
+            p_w = j.get_column("width").to_numpy()
+            p_h = j.get_column("height").to_numpy()
+            v_w = j.get_column("width_v").to_numpy()
+            v_h = j.get_column("height_v").to_numpy()
+
+            if role == "rider":
+                vehicle_width_ratio_arr = v_w / np.maximum(p_w, eps)
+                vehicle_width_ratio = float(np.median(vehicle_width_ratio_arr))
+                vehicle_width_ratio_pass_ratio = float(
+                    (vehicle_width_ratio_arr >= float(min_vehicle_width_ratio)).mean()
+                )
+                if vehicle_width_ratio_pass_ratio < float(min_vehicle_width_ratio_frames):
+                    continue
+            else:
+                vehicle_width_ratio = 0.0
+                vehicle_width_ratio_pass_ratio = 0.0
+
+            dist = np.linalg.norm(p_xy - v_xy, axis=1)
+            if role == "rider":
+                dist_rel = dist / np.maximum(p_h, eps)
+            else:
+                dist_rel = dist / np.maximum(v_h, eps)
+
+            prox = dist_rel < dist_rel_thresh
+            prox_ratio = float(prox.mean())
+            if prox_ratio < prox_req:
+                continue
+
+            relx = v_xy[:, 0] - p_xy[:, 0]
+            rely = v_xy[:, 1] - p_xy[:, 1]
+
+            if role == "rider":
+                spatial = (np.abs(relx) < alpha_x * p_w) & (rely > beta_y * p_h) & (rely < gamma_y * p_h)
+            else:
+                spatial = (np.abs(relx) <= 0.5 * v_w) & (np.abs(rely) <= 0.5 * v_h)
+
+            coloc = prox & spatial
+            coloc_ratio = float(coloc.mean())
+
+            p_mov = np.diff(p_xy, axis=0)
+            v_mov = np.diff(v_xy, axis=0)
+
+            sim_ratio = 0.0
+            if p_mov.shape[0] > 0:
+                na = np.linalg.norm(p_mov, axis=1)
+                nb = np.linalg.norm(v_mov, axis=1)
+                move_mask = (na > eps) & (nb > eps)
+
+                cos = np.zeros_like(na, dtype=float)
+                cos[move_mask] = (p_mov[move_mask] * v_mov[move_mask]).sum(axis=1) / (na[move_mask] * nb[move_mask])
+
+                prox_steps = prox[1:]
+                m = min(len(prox_steps), len(cos), len(move_mask))
+                prox_steps = prox_steps[:m]
+                cos = cos[:m]
+                move_mask = move_mask[:m]
+
+                denom_mask = prox_steps & move_mask
+                denom = int(denom_mask.sum())
+                if denom >= min_motion_steps:
+                    sim_ratio = float(((cos > sim_thresh) & denom_mask).sum() / denom)
+
+            if shared < short_shared_frames:
+                if shared > 1:
+                    p_disp = float(np.linalg.norm(p_xy[-1] - p_xy[0]))
+                    p_disp_rel = p_disp / float(np.maximum(np.mean(p_h), eps))
+                else:
+                    p_disp_rel = 0.0
+
+                if not (sim_ratio >= short_sim_req or p_disp_rel >= short_disp_req):
+                    continue
+
+            ok = (coloc_ratio >= coloc_req) or (sim_ratio >= sim_req and coloc_ratio >= motion_coloc_min)
+            if not ok:
+                continue
+
+            score = 0.7 * coloc_ratio + 0.2 * prox_ratio + 0.1 * float(sim_ratio)
+            cand = {
+                "is_rider": True,
+                "rider_type": vtype,
+                "role": role,
+                "vehicle_id": vid,
+                "score": float(score),
+                "shared_frames": int(shared),
+                "longest_shared_run": int(longest_shared_run),
+                "vehicle_width_ratio": float(vehicle_width_ratio),
+                "vehicle_width_ratio_pass_ratio": float(vehicle_width_ratio_pass_ratio),
+                "prox_ratio": prox_ratio,
+                "coloc_ratio": coloc_ratio,
+                "sim_ratio": float(sim_ratio),
+            }
+
+            if best is None or cand["score"] > best["score"]:
+                best = cand
+
+        if best is None:
+            # The per-id test above needs one two-wheeler track to stay under
+            # the person for a continuous run. In practice the rider's own body
+            # hides the vehicle, so YOLO detects it only intermittently and the
+            # tracker splits it across several ids; no single id then survives
+            # the run requirement even though every detection that exists sits
+            # exactly where a ridden vehicle would. Pool them instead.
+            best = Detection._pooled_two_wheeler_association(
+                p1,
+                vehicles.filter(pl.col("yolo-id").is_in([BICYCLE_CLASS_ID, MOTORCYCLE_CLASS_ID])),
+                min_shared_frames=min_shared_frames,
+                min_continuous_shared_frames=min_continuous_shared_frames,
+                min_vehicle_width_ratio=min_vehicle_width_ratio,
+                dist_rel_thresh=dist_rel_thresh,
+                alpha_x=alpha_x,
+                beta_y=beta_y,
+                gamma_y=gamma_y,
+                min_coverage=pooled_min_coverage,
+                min_person_motion=pooled_min_person_motion,
+                max_motion_mismatch=pooled_max_motion_mismatch,
+                max_offset_std=pooled_max_offset_std,
+                min_seated_share=pooled_min_seated_share,
+                eps=eps,
+            )
+
+        return best if best is not None else not_rider
+
+    @staticmethod
+    def _pooled_two_wheeler_association(
+        person: pl.DataFrame,
+        two_wheelers: pl.DataFrame,
+        *,
+        min_shared_frames: int,
+        min_continuous_shared_frames: int,
+        min_vehicle_width_ratio: float,
+        dist_rel_thresh: float,
+        alpha_x: float,
+        beta_y: float,
+        gamma_y: float,
+        min_coverage: float,
+        min_person_motion: float,
+        max_motion_mismatch: float,
+        max_offset_std: float,
+        min_seated_share: float,
+        eps: float,
+    ) -> Optional[dict]:
+        """Detect a rider from two-wheeler detections pooled across tracker ids.
+
+        ``person`` holds one row per frame. In every frame the two-wheeler
+        nearest the person's centre is kept if it sits in the rider position
+        (below the torso, horizontally overlapping, at least half as wide);
+        the frames that qualify are then judged together:
+
+        - they must number at least ``min_shared_frames`` and span at least
+          ``min_coverage`` of the person's track, so a few coincidental
+          frames at one end of a crossing are not enough;
+        - if the person moved noticeably over that span, the vehicle must have
+          moved with them, which separates a ridden vehicle from a pedestrian
+          walking past a parked one;
+        - if the person barely moved, co-movement cannot be judged, so the
+          vehicle must instead be present for ``min_continuous_shared_frames``
+          frames in total;
+        - the vehicle's horizontal offset from the person must stay steady
+          (standard deviation at most ``max_offset_std`` person widths), and
+          of the frames with any two-wheeler near the person, at least
+          ``min_seated_share`` must have it in the rider position. A cyclist
+          overtaking a pedestrian passes through the rider position briefly
+          while sweeping across the pedestrian's box; a ridden vehicle stays
+          put beneath its rider.
+        """
+        if person.height == 0 or two_wheelers.height == 0:
+            return None
+
+        joined = person.select(
+            ["frame-count", "x-center", "y-center", "width", "height"]
+        ).join(
+            two_wheelers.select(
+                ["frame-count", "unique-id", "yolo-id", "x-center", "y-center", "width", "height"]
+            ),
+            on="frame-count",
+            how="inner",
+            suffix="_v",
+        )
+        if joined.height == 0:
+            return None
+
+        joined = joined.with_columns(
+            (pl.col("x-center_v") - pl.col("x-center")).alias("_relx"),
+            (pl.col("y-center_v") - pl.col("y-center")).alias("_rely"),
+        ).with_columns(
+            (
+                (pl.col("_relx") ** 2 + pl.col("_rely") ** 2).sqrt()
+                / pl.max_horizontal(pl.col("height"), pl.lit(eps))
+            ).alias("_dist_rel"),
+        )
+        seated = joined.filter(
+            (pl.col("_dist_rel") < dist_rel_thresh)
+            & (pl.col("_relx").abs() < alpha_x * pl.col("width"))
+            & (pl.col("_rely") > beta_y * pl.col("height"))
+            & (pl.col("_rely") < gamma_y * pl.col("height"))
+            & (pl.col("width_v") >= min_vehicle_width_ratio * pl.col("width"))
+        )
+        if seated.height == 0:
+            return None
+
+        near_frames = joined.filter(
+            pl.col("_dist_rel") < 1.25 * dist_rel_thresh
+        ).get_column("frame-count").n_unique()
+
+        seated = (
+            seated.sort(["frame-count", "_dist_rel"])
+            .unique(subset=["frame-count"], keep="first")
+            .sort("frame-count")
+        )
+        shared = seated.height
+        if shared < int(min_shared_frames):
+            return None
+
+        seated_share = float(shared) / float(max(near_frames, 1))
+        if seated_share < float(min_seated_share):
+            return None
+
+        offset_std = float(
+            (seated.get_column("_relx") / seated.get_column("width").clip(lower_bound=eps)).std() or 0.0
+        )
+        if offset_std > float(max_offset_std):
+            return None
+
+        person_frames = person.get_column("frame-count").to_numpy()
+        person_span = float(person_frames.max() - person_frames.min() + 1)
+        seated_frames = seated.get_column("frame-count").to_numpy()
+        coverage = float(seated_frames.max() - seated_frames.min() + 1) / max(person_span, 1.0)
+        if coverage < float(min_coverage):
+            return None
+
+        first = seated.row(0, named=True)
+        last = seated.row(-1, named=True)
+        person_disp = np.array(
+            [last["x-center"] - first["x-center"], last["y-center"] - first["y-center"]]
+        )
+        vehicle_disp = np.array(
+            [last["x-center_v"] - first["x-center_v"], last["y-center_v"] - first["y-center_v"]]
+        )
+        median_height = float(max(seated.get_column("height").median() or 0.0, eps))
+        person_motion = float(np.linalg.norm(person_disp)) / median_height
+
+        if person_motion >= float(min_person_motion):
+            mismatch = float(np.linalg.norm(vehicle_disp - person_disp)) / max(
+                float(np.linalg.norm(person_disp)), eps
+            )
+            if mismatch > float(max_motion_mismatch):
+                return None
+        else:
+            mismatch = float("nan")
+            if shared < int(min_continuous_shared_frames):
+                return None
+
+        vehicle_classes = seated.get_column("yolo-id").to_list()
+        majority_class = max(set(vehicle_classes), key=vehicle_classes.count)
+        vehicle_ids = seated.get_column("unique-id").unique().to_list()
+        return {
+            "is_rider": True,
+            "rider_type": "bicycle" if int(majority_class) == BICYCLE_CLASS_ID else "motorcycle",
+            "role": "rider",
+            "vehicle_id": vehicle_ids[0] if len(vehicle_ids) == 1 else vehicle_ids,
+            "score": float(min(1.0, coverage)),
+            "shared_frames": int(shared),
+            "longest_shared_run": int(Detection._longest_frame_run(seated_frames.tolist(), gap_allow=0)),
+            "pooled": True,
+            "pooled_vehicle_ids": len(vehicle_ids),
+            "coverage": coverage,
+            "person_motion": person_motion,
+            "motion_mismatch": mismatch,
+            "seated_share": seated_share,
+            "offset_std": offset_std,
+        }
+
+    @staticmethod
+    def is_rider_id(df: pl.DataFrame, person_id, **kwargs) -> bool:
+        """Return True when the person rides a bicycle or motorcycle. kwargs go to classify_rider_type."""
+        return bool(Detection.classify_rider_type(df, person_id, **kwargs).get("is_rider"))
 
     @staticmethod
     def _static_reference_candidates(df: pl.DataFrame, person_id, static_class_ids, min_shared_frames: int):
@@ -447,12 +848,12 @@ class Detection:
                 yield r, joined
 
     @staticmethod
-    def _robust_range(values, q: float = 0.05) -> float:
+    def _robust_range(values, q: float = 0.05, method: str = "linear") -> float:
         arr = np.asarray(values, dtype=float)
         arr = arr[np.isfinite(arr)]
         if arr.size == 0:
             return 0.0
-        return max(0.0, float(np.quantile(arr, 1.0 - q)) - float(np.quantile(arr, q)))
+        return max(0.0, float(np.quantile(arr, 1.0 - q, method=method)) - float(np.quantile(arr, q, method=method)))
 
     @staticmethod
     def static_reference_motion_stats(df, person_id, STATIC_CLASS_IDS=STATIC_CLASS_IDS,
@@ -494,15 +895,30 @@ class Detection:
 
         When a static object moves across the image as much as the person does, the
         apparent crossing is caused by the dashcam turning, not by the pedestrian.
+        As in crowd-city, ranges here use nearest-rank quantiles.
         """
-        stats = Detection.static_reference_motion_stats(df, person_id, STATIC_CLASS_IDS, MIN_SHARED_FRAMES, Q, EPS)
-        if not stats["has_reference"]:
+        best = None
+        for _, joined in Detection._static_reference_candidates(df, person_id, STATIC_CLASS_IDS, MIN_SHARED_FRAMES):
+            px = joined.get_column("x-center").cast(pl.Float64, strict=False).to_numpy()
+            sx = joined.get_column("x-center_ref").cast(pl.Float64, strict=False).to_numpy()
+            px_rng = Detection._robust_range(px, Q, method="nearest")
+            sx_rng = Detection._robust_range(sx, Q, method="nearest")
+            cand = {
+                "shared": int(joined.height),
+                "sx_rng": sx_rng,
+                "relx_rng": Detection._robust_range(px - sx, Q, method="nearest"),
+                "ratio": sx_rng / max(px_rng, float(EPS)),
+            }
+            if best is None or (cand["shared"], cand["sx_rng"]) > (best["shared"], best["sx_rng"]):
+                best = cand
+
+        if best is None:
             return True
 
-        if stats["relative_x_range"] < RELX_MIN:
+        if best["relx_rng"] < RELX_MIN:
             return False
 
-        if stats["static_to_person_ratio"] >= float(ratio_thresh) and stats["relative_x_range"] < (2.0 * RELX_MIN):
+        if best["ratio"] >= float(ratio_thresh) and best["relx_rng"] < (2.0 * RELX_MIN):
             return False
 
         return True

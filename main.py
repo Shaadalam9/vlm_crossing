@@ -31,21 +31,41 @@ def bbox_dir() -> str:
     return os.path.join(common.get_output_dir(), "bbox")
 
 
-def build_mapping(helper: Video_Helper, videos) -> pl.DataFrame:
+def previous_mapping(path: str) -> dict:
+    """Rows of an existing videos.csv keyed by video path, to skip re-reading unchanged videos."""
+    if not os.path.exists(path):
+        return {}
+    try:
+        old = pl.read_csv(path, schema_overrides={"city": pl.Utf8, "video": pl.Utf8})
+    except Exception:
+        return {}
+    if not {"video_path", "file_size", "file_mtime_ns"}.issubset(old.columns):
+        return {}
+    return {row["video_path"]: row for row in old.iter_rows(named=True)}
+
+
+def build_mapping(helper: Video_Helper, videos, previous: dict) -> pl.DataFrame:
     """
     Read metadata of every video and return the video mapping.
 
     Args:
         helper (Video_Helper): Helper instance.
         videos (list): (city, video_path) tuples.
+        previous (dict): Output of previous_mapping; unchanged videos are not opened again.
 
     Returns:
         pl.DataFrame: One row per readable video.
     """
     rows = []
     seen = {}
+    prop_keys = ("fps", "frames", "width", "height", "duration_s")
     for city, path in videos:
-        props = helper.get_video_properties(path)
+        stamp = helper.file_stamp(path)
+        old = previous.get(os.path.abspath(path))
+        if old is not None and all(old.get(k) == v for k, v in stamp.items()):
+            props = {k: old[k] for k in prop_keys}
+        else:
+            props = helper.get_video_properties(path)
         if props is None:
             continue
         csv_name = helper.csv_name(path, props["fps"])
@@ -60,6 +80,7 @@ def build_mapping(helper: Video_Helper, videos) -> pl.DataFrame:
             "video_path": os.path.abspath(path),
             "csv": os.path.join(bbox_dir(), city, csv_name),
             **props,
+            **stamp,
         })
     return pl.DataFrame(rows) if rows else pl.DataFrame()
 
@@ -79,11 +100,16 @@ def track_videos(helper: Video_Helper, mapping: pl.DataFrame) -> dict:
     save_annotated_video = common.get_configs("save_annotated_video")
     runs_root = common.resolve_path(common.get_configs("runs_root"))
     counts = {"tracked": 0, "skipped": 0, "failed": 0}
+    settings = helper.tracking_settings()
+    outdated = []
 
     for i, row in enumerate(mapping.iter_rows(named=True), start=1):
         csv_path = row["csv"]
         if os.path.exists(csv_path) and not always_analyse:
             logger.debug(f"CSV for {row['video_path']} exists; skipping.")
+            stored = helper.stored_tracking_settings(csv_path)
+            if stored is not None and stored != settings:
+                outdated.append(csv_path)
             counts["skipped"] += 1
             continue
 
@@ -105,6 +131,10 @@ def track_videos(helper: Video_Helper, mapping: pl.DataFrame) -> dict:
             ok = False
         counts["tracked" if ok else "failed"] += 1
 
+    if outdated:
+        logger.warning(f"{len(outdated)} tracking CSVs were made with different tracking settings than the current "
+                       f"config, e.g. {outdated[0]}. They are kept; delete them, or set always_analyse to true, "
+                       f"to track them again.")
     if common.get_configs("delete_runs_files"):
         helper.delete_folder(runs_root)
     return counts
@@ -123,8 +153,8 @@ if __name__ == "__main__":
         if not videos:
             raise SystemExit(0)
 
-        mapping = build_mapping(helper, videos)
         mapping_path = os.path.join(common.get_output_dir(), VIDEOS_CSV)
+        mapping = build_mapping(helper, videos, previous_mapping(mapping_path))
         mapping.write_csv(mapping_path)
         logger.info(f"Wrote video mapping to {mapping_path}.")
 

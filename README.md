@@ -37,7 +37,7 @@ cp default.config config
 
 ## Running
 
-1. **Tracking** writes one CSV per video to `_output/bbox/<city>/<video>_<fps>.csv`, plus `_output/videos.csv` (city, fps, size and duration of every video). Videos that already have a CSV are skipped unless `always_analyse` is true. An interrupted video is redone on the next run.
+1. **Tracking** writes one CSV per video to `_output/bbox/<city>/<video>_<fps>.csv`, a `<video>_<fps>.json` next to it with the tracking settings used, and `_output/videos.csv` (city, fps, size and duration of every video). Videos that already have a CSV are skipped unless `always_analyse` is true, and an interrupted video is redone on the next run. If the tracking settings in `config` differ from those stored with a CSV, the run warns but keeps the CSV: delete it (or set `always_analyse`) to track it again.
 
    ```bash
    uv run python main.py
@@ -45,21 +45,39 @@ cp default.config config
 
    The first run downloads `yolo11x.pt` through ultralytics. The device is picked automatically (CUDA, Apple MPS, then CPU).
 
-2. **Analysis** writes `_output/crossings.csv` (one row per crossing), `_output/city_summary.csv` (one row per city) and plots in `_output/figures/`.
+2. **Analysis** writes `_output/crossings.parquet` and `_output/crossings.csv` (one row per crossing), `_output/city_summary.csv` (one row per city) and plots in `_output/figures/`.
 
    ```bash
    uv run python analysis.py
    ```
 
+   Add `--force` to ignore the cache and analyse every video again.
+
+### What is rerun
+
+Both stages only process what changed, so adding videos or editing the analysis code is cheap.
+
+| Change | Rerun |
+|---|---|
+| New video in `data/` | Tracking and analysis of that video only |
+| Nothing | Nothing (cached results are combined again) |
+| Code in `utils/crossing/metrics.py`, or `check_per_sec_time`, `hesitation_reference`, stature | Metrics of every video; detection reused, tracking CSVs not read for detection |
+| Code in `utils/crossing/detection.py`, or `boundary_left` / `boundary_right` | Detection of every video; metrics reused for videos whose crossings are unchanged |
+| A tracking CSV is rewritten | Analysis of that video |
+| Comments, docstrings or formatting in the analysis code | Nothing |
+| Speed or waiting-time limits, plots, summary code | Nothing (always rebuilt from the cached values) |
+
+Per-video results are cached in `_output/analysis/<city>/<video>_<fps>.json`: the detected crossings (track id and frame bounds) and one row of raw metrics per crossing, each stored with a key built from its inputs (see `utils/cache.py`). Code is fingerprinted from its syntax tree, so only real code changes count. Video metadata in `videos.csv` is also reused for files whose size and modification time are unchanged.
+
 The tracking CSV columns are the same as CROWD's (`yolo-id, x-center, y-center, width, height, unique-id, confidence, frame-count`, boxes normalised to the frame), so `analysis.py` also works on CROWD CSVs listed in a `videos.csv`.
 
 ## Method
 
-**Crossing detection** (`utils/crossing/detection.py`) is ported from crowd-city. A person track is a crossing when it moves from one side of the image, through the central strip `[boundary_left, boundary_right]`, to the other side. Candidates are then rejected by CROWD's geometric filters: too little lateral movement, jitter, tiny or slender boxes, and camera motion measured against static objects. People riding bicycles or motorcycles are also rejected. The rider test is a simplified co-location check instead of crowd-city's pooled rider classifier.
+**Crossing detection** (`utils/crossing/detection.py`) is ported from crowd-city. A person track is a crossing when it moves from one side of the image, through the central strip `[boundary_left, boundary_right]`, to the other side. Candidates are then rejected by CROWD's geometric filters: too little lateral movement, jitter, tiny or slender boxes, and camera motion measured against static objects. People riding bicycles or motorcycles are also rejected with crowd-city's rider classifier: a two-wheeler that stays under the person, is wide enough and moves with them, including detections pooled across fragmented vehicle track ids.
 
 **Crossing speed** (`utils/crossing/metrics.py`). crowd-city converts box motion to m/s with a model calibrated on the Waymo Open Dataset, which is not included here. Instead, the pinhole relation places the pedestrian in metres: a person of stature *H* whose box is *h* tall is at lateral position `X = (x − 0.5) · aspect · H / h`. Forward motion of the car does not change *X*, so it cancels out. The speed is the Theil–Sen slope of *X* over time, fitted after the hesitation interval. The stature is `person_height_m` (1.70 m), and `city_person_height_m` can override it per city, e.g. `{"Amsterdam": 1.78}`.
 
-**Hesitation time** follows crowd-city's `time_to_start_cross`. The track is sampled `check_per_sec_time` times per second. A sample is stationary when the pedestrian moved at most 10% of their stature since the previous one. The hesitation time is the first run of at least three stationary samples. With `"hesitation_reference": "road_entry"` it is instead the stationary run ending when the pedestrian enters the road strip, as in crowd-city's `road_metrics.hesitation_seconds`. Crossings without such a run get `0.0` and `hesitated = false`. `city_summary.csv` reports both the mean over all crossings and the mean over those who hesitated.
+**Hesitation time** follows crowd-city's `time_to_start_cross`. The track is sampled `check_per_sec_time` times per second, on frame numbers rather than detections, so missed frames do not change the measured time. A sample is stationary when the pedestrian moved at most 10% of their stature since the previous one. The hesitation time is the first run of at least three stationary samples. With `"hesitation_reference": "road_entry"` it is instead the stationary run ending when the pedestrian enters the road strip, as in crowd-city's `road_metrics.hesitation_seconds`. Crossings without such a run get `0.0` and `hesitated = false` in `crossings.csv`. As in crowd-city (commit `46ff6d6`), such a pedestrian has no hesitation time rather than one of zero, so the hesitation mean, median, standard deviation and plots in `city_summary.csv` and `figures/` use only the crossings with a wait (`crossings_hesitated`). `share_hesitated` gives the fraction that waited, and `hesitation_mean_all_s` the mean including the zeros.
 
 ### Limitations
 
