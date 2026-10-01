@@ -1,15 +1,9 @@
 """Per-video result cache so analysis.py only recomputes what changed.
 
 Every analysed video gets one JSON file, <output>/analysis/<city>/<video>.json,
-holding two stages:
-
-- "detection": the accepted crossings (track id and frame bounds) and the
-  candidate ids, keyed on the tracking CSV, the video fps, the road strip and
-  the code of utils/crossing/detection.py.
-- "metrics": one row per crossing, keyed on the detection *result* (not its
-  key, so a detection change that finds the same crossings keeps the metrics),
-  the video geometry, the hesitation and stature settings and the code of
-  utils/crossing/metrics.py.
+holding the crowd-city results of that video under a key built from its
+inputs: the tracking CSV and video file, the settings that change the result,
+and a fingerprint of the crowd_city code and analysis.py.
 
 A stage is reused when its stored key equals the key computed now. Code is
 fingerprinted from its syntax tree with docstrings removed, so editing
@@ -19,7 +13,6 @@ summaries and figures are cheap and are always rebuilt from the cached rows.
 
 import ast
 import hashlib
-import inspect
 import json
 import os
 from functools import lru_cache
@@ -50,12 +43,6 @@ def file_fingerprint(path: str) -> str:
     """source_fingerprint of a Python file, computed once per process."""
     with open(path) as f:
         return source_fingerprint(f.read())
-
-
-def object_fingerprint(obj: Any) -> str:
-    """source_fingerprint of a function or class."""
-    import textwrap
-    return source_fingerprint(textwrap.dedent(inspect.getsource(obj)))
 
 
 def input_fingerprint(path: str) -> Dict[str, int]:

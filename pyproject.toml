@@ -8,7 +8,7 @@ dependencies = [
     "coloredlogs>=15.0.1",
     "flake8==7.1.1",
     "kaleido==0.2.1",
-    "lap>=0.5.12",
+    "lap==0.5.12",
     "numpy>=1.26",
     "pandas>=2.1",
     "opencv-python>=4.9",
@@ -17,8 +17,10 @@ dependencies = [
     "pyyaml>=6.0",
     "torch>=2.3",
     "torchvision>=0.18",
+    "requests>=2.31",
     "tqdm>=4.66",
-    "ultralytics>=8.3.182",
+    "transformers==5.17.0",
+    "ultralytics==8.4.46",
 ]
 
 [tool.flake8]

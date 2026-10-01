@@ -34,6 +34,11 @@ logging.getLogger("ultralytics").setLevel(logging.ERROR)  # Show only errors
 LINE_THICKNESS = 1
 TRACK_TRAIL_LENGTH = 30
 CSV_COLUMNS = ["yolo-id", "x-center", "y-center", "width", "height", "unique-id", "confidence", "frame-count"]
+# YOLO confidence used while tracking. As in crowd (helper_script.Youtube_Helper),
+# every box is kept and the tracker sees all of them; min_confidence is applied
+# when crowd-city reads the CSV. The Waymo speed model is calibrated on tracks
+# made this way.
+YOLO_CONFIDENCE = 0.0
 
 
 class Video_Helper:
@@ -42,13 +47,13 @@ class Video_Helper:
     Attributes:
         tracking_model (str): YOLO weights, e.g. yolo11x.pt (downloaded by ultralytics if missing).
         bbox_tracker (str): Tracker YAML (BoT-SORT).
-        confidence (float): Minimum detection confidence.
+        confidence (float): YOLO confidence threshold while tracking (YOLO_CONFIDENCE).
     """
 
     def __init__(self):
         self.tracking_model = common.get_configs("tracking_model")
         self.bbox_tracker = common.get_configs("bbox_tracker")
-        self.confidence = common.get_configs("min_confidence")
+        self.confidence = YOLO_CONFIDENCE
         self.imgsz = common.get_configs("yolo_imgsz")
         self.half = common.get_configs("half_precision")
         self.display_frame_tracking = common.get_configs("display_frame_tracking")
@@ -165,7 +170,7 @@ class Video_Helper:
             tracker_config.pop("track_buffer", None)  # replaced by track_buffer_sec
         return {
             "tracking_model": self.tracking_model,
-            "min_confidence": self.confidence,
+            "yolo_confidence": self.confidence,
             "yolo_imgsz": self.imgsz,
             "half_precision": self.half,
             "track_buffer_sec": common.get_configs("track_buffer_sec"),

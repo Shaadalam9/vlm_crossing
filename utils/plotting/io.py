@@ -25,6 +25,8 @@ class IO:
         """
         Save a Plotly figure as HTML, and as PNG and EPS when save_images is true.
 
+        The HTML file is opened in the default browser when open_figures is true.
+
         Args:
             fig (plotly.graph_objs.Figure): Plotly figure object.
             filename (str): Name of the file (without extension) to save.
@@ -40,7 +42,8 @@ class IO:
 
         output = self.figures_dir()
         logger.info(f"Saving html file for {filename}.")
-        py.offline.plot(fig, filename=os.path.join(output, filename + ".html"), auto_open=False)
+        py.offline.plot(fig, filename=os.path.join(output, filename + ".html"),
+                        auto_open=bool(common.get_configs("open_figures")))
 
         try:
             if save_png:
